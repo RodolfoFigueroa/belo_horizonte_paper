@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.23.9"
+__generated_with = "0.23.6"
 app = marimo.App(width="medium")
 
 with app.setup:
@@ -11,11 +11,11 @@ with app.setup:
     from pathlib import Path
     from typing import Literal
 
-    import marimo as mo
     import ee
     import geemap
     import geopandas as gpd
     import numpy as np
+    import osmnx as ox
     import pandas as pd
     import rioxarray as rxr
     import shapely
@@ -27,6 +27,7 @@ with app.setup:
     from xrspatial import aspect, slope
 
     from belo_horizonte_paper.bounds import load_bounds
+    from belo_horizonte_paper.constants import LST_DEFAULT_YEAR
     from belo_horizonte_paper.temperature import get_lst
     from belo_horizonte_paper.utils import clamp_bounds
 
@@ -41,7 +42,7 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     # Bounds
     """)
@@ -51,11 +52,11 @@ def _():
 @app.cell
 def _(data_path):
     bounds_ee, bounds = load_bounds(data_path=data_path, return_geometry=True)
-    return (bounds_ee,)
+    return bounds, bounds_ee
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     # LST
     """)
@@ -71,7 +72,7 @@ def _(bounds_ee):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     # Zones
     """)
@@ -79,7 +80,7 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## Points
     """)
@@ -159,12 +160,14 @@ def _(crs, df_zones_joined, generated_path, get_zone_sample_points):
         df_sample_points.to_crs("EPSG:4326")
     )
 
+    col_sample_points_buffered = col_sample_points.map(lambda feature: feature.buffer(50))
+
     df_sample_points.to_file(generated_path / "sample_points.gpkg")
-    return col_sample_points, df_sample_points
+    return col_sample_points, col_sample_points_buffered, df_sample_points
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     # Data
     """)
@@ -202,7 +205,7 @@ def _(crs):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## Canopy
     """)
@@ -216,7 +219,6 @@ def _(bounds_ee, col_sample_points: ee.FeatureCollection, sample_image):
         .filterBounds(bounds_ee)
         .first()
         .gte(ee.Number(3))
-        .clip(bounds_ee)
     )
 
     img_canopy_fraction = img_canopy.reduceResolution(
@@ -232,7 +234,7 @@ def _(bounds_ee, col_sample_points: ee.FeatureCollection, sample_image):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## Lights
     """)
@@ -257,7 +259,7 @@ def _(bounds_ee, col_sample_points: ee.FeatureCollection, sample_image):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## LST
     """)
@@ -271,7 +273,7 @@ def _(col_sample_points: ee.FeatureCollection, img_lst, sample_image):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## Topography
     """)
@@ -319,7 +321,7 @@ def _(arr_aspect, arr_elevation, arr_slope, df_sample_points, sample_arr):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## Land use
     """)
@@ -365,7 +367,7 @@ def _(crs, data_path, df_sample_points):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## Distance to edge
     """)
@@ -388,16 +390,30 @@ def _(df_sample_points, df_zones_joined):
             is_inside=lambda df: df["zone_unbuffered"].contains(df["point"]),
             boundary_dist=lambda df: df["zone_boundary"].distance(df["point"]),
             dist_inside=lambda df: df["boundary_dist"].where(df["is_inside"], 0),
-            dist_outside=lambda df: df["boundary_dist"].where(~df["is_inside"], 0)
+            dist_outside=lambda df: df["boundary_dist"].where(~df["is_inside"], 0),
         )
         .assign(is_inside=lambda df: df["is_inside"].astype(int))
-        [["is_inside", "dist_inside", "dist_outside"]]
+        .assign(
+            dist_sign=lambda df: df["is_inside"].astype(int).mul(2).add(-1),
+            signed_distance=lambda df: df["dist_sign"].mul(df["boundary_dist"]),
+        )
+        .drop(
+            columns=[
+                "point",
+                "zone",
+                "zone_unbuffered",
+                "zone_boundary",
+                "boundary_dist",
+                "dist_sign",
+                "zone_id",
+            ]
+        )
     )
     return (sampled_distances_edge,)
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## Impervious surface
     """)
@@ -416,16 +432,137 @@ def _(col_sample_points: ee.FeatureCollection, sample_image):
 
 
 @app.cell
-def _(col_sample_points: ee.FeatureCollection, img_impervious, sample_image):
-    buffered_samples = col_sample_points.map(lambda feature: feature.buffer(50))
+def _(col_sample_points_buffered, img_impervious, sample_image):
     sampled_impervious = sample_image(
-        img_impervious, buffered_samples, reducer=ee.Reducer.mean(), scale=30
+        img_impervious, col_sample_points_buffered, reducer=ee.Reducer.mean(), scale=30
     ).rename("impervious_frac")
     return (sampled_impervious,)
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
+    mo.md(r"""
+    ## Building height
+    """)
+    return
+
+
+@app.cell
+def _(bounds_ee, col_sample_points_buffered, sample_image):
+    building_height_year = LST_DEFAULT_YEAR + 1
+
+    img_height = (
+        ee.ImageCollection("GOOGLE/Research/open-buildings-temporal/v1")
+        .filterBounds(bounds_ee)
+        .filterDate(f"{building_height_year}-01-01", f"{building_height_year}-12-31")
+        .first()
+        .select("building_height")
+    )
+
+    sampled_height = sample_image(
+        img_height, col_sample_points_buffered, ee.Reducer.mean(), scale=4
+    ).rename("building_height")
+    return (sampled_height,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Water fraction
+    """)
+    return
+
+
+@app.cell
+def _(bounds_ee, col_sample_points_buffered, sample_image):
+    img_class = ee.ImageCollection("ESA/WorldCover/v200").filterBounds(bounds_ee).first()
+
+    img_water = (
+        img_class.eq(80)  # Permanent water bodies
+        .Or(img_class.eq(90))  # Herbaceous wetland
+        .Or(img_class.eq(95))  # Mangroves
+        .multiply(ee.Image.pixelArea())
+    )
+
+
+    sampled_water = sample_image(
+        img_water, col_sample_points_buffered, reducer=ee.Reducer.sum(), scale=10
+    )
+    return
+
+
+@app.cell
+def _(bounds):
+    features_water = ox.features_from_bbox(
+        tuple(bounds.total_bounds), tags={"water": True, "waterway": True}
+    )
+    features_water = (
+        features_water.assign(
+            water_type=lambda df: pd.concat(
+                [df["water"].dropna(), df["waterway"].dropna()]
+            ),
+            intermittent=lambda df: (
+                df["intermittent"].fillna("no").map({"yes": True, "no": False}).astype(bool)
+            ),
+            tunnel=lambda df: (
+                df["tunnel"].where(df["tunnel"].isna(), True).fillna(False).astype(bool)
+            ),
+        )
+        .drop(columns=["water", "waterway"])
+        .loc[
+            lambda df: (
+                (df["geometry"].geom_type != "Point")
+                & (
+                    ~df["water_type"].isin(["dam", "pool", "reflecting_pool"])
+                )  # Remove extraneous types
+                & (~df["intermittent"])  # Remove intermittent sources
+                & (~df["tunnel"])  # Remove underground streams
+            )
+        ]
+    )
+    return (features_water,)
+
+
+@app.cell
+def _(df_sample_points, features_water):
+    natural_water_types = ["stream", "river", "lake", "reservoir", "pond"]
+    standing_water_types = ["lake", "reservoir", "pond"]
+
+    sampled_water_dist = (
+        df_sample_points.sjoin_nearest(
+            features_water.loc[
+                lambda df: df["water_type"].isin(natural_water_types), ["geometry"]
+            ].to_crs(df_sample_points.crs),
+            distance_col="dist",
+        )
+        .sort_values("dist", ascending=True)
+        .reset_index(names="index")
+        .drop_duplicates(subset=["index"])
+        .set_index("index")
+        ["dist"]
+        .rename("dist_to_water")
+    )
+
+    sampled_is_near_standing_water = (
+        df_sample_points.sjoin_nearest(
+            features_water.loc[
+                lambda df: df["water_type"].isin(standing_water_types), ["geometry"]
+            ].to_crs(df_sample_points.crs),
+            distance_col="dist",
+            max_distance=250,
+        )
+        .assign(dist=True)
+        ["dist"]
+        .reindex(df_sample_points.index, fill_value=False)
+        .astype(bool)
+        .astype(int)
+        .rename("is_near_standing_water")
+    )
+    return sampled_is_near_standing_water, sampled_water_dist
+
+
+@app.cell(hide_code=True)
+def _(mo):
     mo.md(r"""
     ## Final
     """)
@@ -440,12 +577,15 @@ def _(
     sampled_aspect,
     sampled_distances_edge,
     sampled_elevation,
+    sampled_height,
     sampled_impervious,
     sampled_impervious_binary,
+    sampled_is_near_standing_water,
     sampled_lights,
     sampled_lst,
     sampled_slope,
     sampled_trees,
+    sampled_water_dist,
 ):
     df_model = pd.concat(
         [
@@ -457,12 +597,18 @@ def _(
             sampled_lights,
             sampled_impervious_binary,
             sampled_impervious,
+            sampled_height,
+            sampled_water_dist,
+            sampled_is_near_standing_water,
         ],
         axis=1,
     ).assign(elevation=sampled_elevation)
 
     df_model = (
-        pd.concat([df_model, df_sampled_land_use, df_sample_points, sampled_distances_edge], axis=1)
+        pd.concat(
+            [df_model, df_sampled_land_use, df_sample_points, sampled_distances_edge],
+            axis=1,
+        )
         .assign(
             lights_log=lambda df: np.log(df["lights"]),
             aspect_rad=lambda df: np.deg2rad(df["aspect"]),
@@ -475,7 +621,7 @@ def _(
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     # OLS
     """)
@@ -495,10 +641,14 @@ def _(crs, df_model):
         "landuse_non_residential",
         "landuse_park",
         "landuse_residential",
-        "is_inside",
+        "is_near_standing_water",
+        "dist_to_water",
+        # "is_inside",
         "dist_inside",
         "dist_outside",
+        # "signed_distance",
         "impervious_frac",
+        "building_height",
     ]
 
     df_analysis = gpd.GeoDataFrame(
@@ -506,17 +656,21 @@ def _(crs, df_model):
         geometry="geometry",
         crs=crs,
     )
+    return df_analysis, vars_
 
+
+@app.cell
+def _(df_analysis, vars_):
     ols = smf.ols(
         "lst ~ " + " + ".join(vars_),
         data=df_analysis,
     ).fit()
     print(ols.summary())
-    return df_analysis, ols, vars_
+    return (ols,)
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     # Spatial
     """)
@@ -585,7 +739,7 @@ def _(ols, w):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## OLS
     """)
@@ -612,7 +766,7 @@ def _(df_analysis, vars_, w):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## SEM
     """)
@@ -633,7 +787,7 @@ def _(X, vars_, w, y):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## SLM
     """)
@@ -654,7 +808,7 @@ def _(X, vars_, w, y):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## SDM
     """)
@@ -679,7 +833,7 @@ def _(X, vars_, w, y):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## Summary
     """)
@@ -708,7 +862,7 @@ def _(err_model, lag_model, sdm_model, w):
         ]
     )
 
-    comparison
+    comparison.sort_values("aic")
     return
 
 
@@ -755,7 +909,7 @@ def _(X, build_within_zone_weights, df_analysis, vars_, y):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     # SDM
     """)
@@ -763,7 +917,7 @@ def _():
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## Distance band
     """)
@@ -792,7 +946,7 @@ def _(X, build_within_zone_weights, df_analysis, vars_, y):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(mo):
     mo.md(r"""
     ## KNN
     """)
@@ -801,7 +955,9 @@ def _():
 
 @app.cell
 def _(X, build_within_zone_weights, df_analysis, vars_, y):
-    w_knn = build_within_zone_weights(df_analysis, zone_col="zone_id", method="knn", param=4)
+    w_knn = build_within_zone_weights(
+        df_analysis, zone_col="zone_id", method="knn", param=4
+    )
 
     knn_second = spreg.ML_Lag(
         y,
@@ -818,15 +974,48 @@ def _(X, build_within_zone_weights, df_analysis, vars_, y):
     return
 
 
-@app.cell
-def _(df_analysis):
-    df_analysis["dist_inside"].plot.hist()
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    # Final model
+    """)
     return
 
 
 @app.cell
-def _(df_analysis):
-    df_analysis["dist_outside"].plot.hist()
+def _(build_within_zone_weights, df_analysis, y):
+    final_vars = [
+        "trees",
+        "elevation",
+        "slope",
+        "aspect_sin",
+        "aspect_cos",
+        "lights_log",
+        "landuse_non_residential",
+        "landuse_residential",
+        "dist_outside",
+        "impervious_frac",
+        "building_height",
+    ]
+
+    X_final = df_analysis[final_vars].to_numpy()
+
+    w_final = build_within_zone_weights(
+        df_analysis, zone_col="zone_id", method="distance", param=50
+    )
+
+    model_final = spreg.ML_Lag(
+        y,
+        X_final,
+        w=w_final,
+        slx_lags=1,
+        slx_vars="All",
+        name_y="lst",
+        name_x=final_vars,
+        spat_impacts="full",
+    )
+
+    print(model_final.summary)
     return
 
 
